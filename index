@@ -1,0 +1,116 @@
+/**
+ * Bot WhatsApp protecteur anti-bug et anti-ban
+ * Auteur : Influenceur
+ */
+
+const { default: makeWASocket, useSingleFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@adiwajshing/baileys');
+const P = require('pino');
+const express = require('express');
+const fs = require('fs');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+const { state, saveState } = useSingleFileAuthState('./session.json');
+
+async function startBot() {
+  const { version } = await fetchLatestBaileysVersion();
+
+  const sock = makeWASocket({
+    auth: state,
+    version,
+    printQRInTerminal: true,
+    logger: P({ level: 'silent' }),
+  });
+
+  sock.ev.on('connection.update', (update) => {
+    const { connection, lastDisconnect } = update;
+    if(connection === 'close') {
+      if((lastDisconnect.error)?.output?.statusCode !== DisconnectReason.loggedOut) {
+        startBot();
+      } else {
+        console.log('Déconnecté. Scanne le QR à nouveau.');
+      }
+    } else if(connection === 'open') {
+      console.log('Connecté à WhatsApp.');
+    }
+  });
+
+  sock.ev.on('creds.update', saveState);
+
+  // Commandes simples
+  sock.ev.on('messages.upsert', async ({ messages }) => {
+    const msg = messages[0];
+    if (!msg.message) return;
+    if (msg.key.fromMe) return;
+
+    const from = msg.key.remoteJid;
+    const sender = msg.key.participant || msg.key.remoteJid;
+    const messageContent = (msg.message.conversation || msg.message.extendedTextMessage?.text || '').trim();
+
+    // Bloque messages bugs (exemple basique)
+    if(messageContent.includes('\u200e')) {
+      await sock.updateBlockStatus(from, 'block');
+      console.log(`Bloqué : ${from} pour message bug.`);
+      return;
+    }
+
+    // Réagir aux commandes
+    if(messageContent.startsWith('!')) {
+      const command = messageContent.slice(1).toLowerCase();
+
+      // !help
+      if(command === 'help') {
+        await sock.sendMessage(from, { text: "Commandes disponibles:\n!kickall - Expulse tous les membres\n!kickall2 - Même fonction que kickall\n!ban [numéro] - Banne un numéro\n!help - Affiche ce message" });
+      }
+
+      // !kickall et !kickall2 : expulse tous sauf toi (dans un groupe)
+      else if(command === 'kickall' || command === 'kickall2') {
+        if(!from.endsWith('@g.us')) {
+          await sock.sendMessage(from, { text: 'Cette commande fonctionne uniquement dans les groupes.' });
+          return;
+        }
+        try {
+          const groupMetadata = await sock.groupMetadata(from);
+          const admins = groupMetadata.participants.filter(p => p.admin !== null).map(p => p.id);
+          for(const participant of groupMetadata.participants) {
+            if(!admins.includes(participant.id)) {
+              await sock.groupRemove(from, [participant.id]);
+              console.log(`Expulsé : ${participant.id}`);
+            }
+          }
+          await sock.sendMessage(from, { text: 'Tous les membres non-admins ont été expulsés.' });
+        } catch (e) {
+          await sock.sendMessage(from, { text: `Erreur: ${e.message}` });
+        }
+      }
+
+      // !ban [numéro]
+      else if(command.startsWith('ban')) {
+        const parts = command.split(' ');
+        if(parts.length < 2) {
+          await sock.sendMessage(from, { text: 'Usage: !ban +226XXXXXXXXX' });
+          return;
+        }
+        const banNumber = parts[1].includes('@s.whatsapp.net') ? parts[1] : parts[1] + '@s.whatsapp.net';
+        try {
+          await sock.updateBlockStatus(banNumber, 'block');
+          await sock.sendMessage(from, { text: `${banNumber} a été banni.` });
+          console.log(`Banni : ${banNumber}`);
+        } catch(e) {
+          await sock.sendMessage(from, { text: `Erreur: ${e.message}` });
+        }
+      }
+    }
+  });
+
+  app.get('/', (req, res) => {
+    res.send('Bot WhatsApp protecteur en marche.');
+  });
+
+  app.listen(PORT, () => {
+    console.log(`Serveur en écoute sur port ${PORT}`);
+  });
+}
+
+startBot();
